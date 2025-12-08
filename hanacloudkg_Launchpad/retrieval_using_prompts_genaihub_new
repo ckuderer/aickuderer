@@ -1,0 +1,228 @@
+# Scenario: Provide User Prompt and retrieve response from KGs from SAP HANA Cloud
+# using Anthropic Claude via SAP GenAI Hub
+
+# =====================
+# Imports
+# =====================
+import os
+from typing_extensions import TypedDict, Annotated
+
+from hdbcli import dbapi                    # SAP HANA database connector
+from langchain_core.prompts import PromptTemplate
+from gen_ai_hub.proxy.langchain.amazon import ChatBedrock
+from gen_ai_hub.proxy.core.proxy_clients import get_proxy_client
+
+
+# =====================
+# AI Core / GenAI Hub Credentials
+# (Bitte in der Praxis NICHT hardcoden, sondern aus Secrets/.env lesen!)
+# =====================
+os.environ['AICORE_AUTH_URL'] = "https://5-go-ai-innovation-hub-wvzrulyu.authentication.eu10.hana.ondemand.com"
+os.environ['AICORE_CLIENT_ID'] = "sb-f7991d09-8de8-4497-bf25-309dfa43f62c!b557249|aicore!b540"
+os.environ['AICORE_RESOURCE_GROUP'] = 'default'
+os.environ['AICORE_CLIENT_SECRET'] = "ee850c1a-278f-44fb-a4eb-d66eff1ab006$wGy9EaaBoTphfRZNaF_MSGpctylD0dy3hUk1VbvHB14="
+os.environ['AICORE_BASE_URL'] = "https://api.ai.prod.eu-central-1.aws.ml.hana.ondemand.com"
+
+# Proxy-Client für GenAI Hub
+proxy_client = get_proxy_client('gen-ai-hub')
+
+# Claude über Bedrock
+anthropic = ChatBedrock(
+    model_name="anthropic--claude-4.5-sonnet",
+    proxy_client=proxy_client
+)
+
+
+# =====================
+# HANA-Verbindung
+# =====================
+# Bitte Username/Passwort/Host anpassen
+conn = dbapi.connect(
+    address="fec127f4-1bb2-4d30-82e7-083e503ab016.hna1.prod-eu10.hanacloud.ondemand.com",
+    port=443,
+    user="CKUDERER",
+    password="XPRLYQZxeno5712@",
+    databaseName="H00",
+    encrypt="true",
+    sslValidateCertificate="false"
+)
+
+
+# =====================
+# SPARQL-Template für deinen sflights-KG
+# =====================
+template = '''Given an input question, your task is to create a syntactically correct SPARQL query
+to retrieve information from the sflights RDF graph.
+
+The data is stored in the named graph <http://example.org/sflights/kg_sflights>.
+IRIs in this graph usually start with the namespace "http://example.org/sflights#".
+In the RDF graph, subjects are represented as "s", objects as "o", and predicates as "p".
+
+The graph may contain variations in spacing, underscores, dashes, capitalization,
+reversed relationships, and word order. You must account for these variations
+using the REGEX() function in SPARQL (for example on airport codes, city names,
+country names, or route codes).
+
+Example Question:
+"Which routes go from Frankfurt (FRA) to New York (JFK)?"
+
+Example SPARQL Query:
+SELECT ?route ?originAirport ?destinationAirport ?distanceKm ?capacity
+FROM <http://example.org/sflights/kg_sflights>
+WHERE {{
+    ?route a <http://example.org/sflights#Route> .
+    ?route <http://example.org/sflights#origin> ?originAirport .
+    ?route <http://example.org/sflights#destination> ?destinationAirport .
+    OPTIONAL {{ ?route <http://example.org/sflights#distanceKm> ?distanceKm . }}
+    OPTIONAL {{ ?route <http://example.org/sflights#passengerCapacity> ?capacity . }}
+    FILTER(
+        ( REGEX(STR(?originAirport), "FRA", "i")  || REGEX(STR(?originAirport), "Frankfurt", "i") ) &&
+        ( REGEX(STR(?destinationAirport), "JFK", "i") || REGEX(STR(?destinationAirport), "New York", "i") )
+    )
+}}
+
+Always:
+- Use FROM <http://example.org/sflights/kg_sflights> to restrict the query to this named graph.
+- Use the http://example.org/sflights# namespace for classes and predicates.
+- Return useful fields like route, origin, destination, distanceKm, passengerCapacity, airline,
+  cityName, countryName, etc., if they are relevant to the question.
+
+Return your answer ONLY as a SPARQL query string.
+Do NOT include explanations, comments, prefixes, or any other natural language text.
+
+Use the following format internally to derive the query:
+
+Question: {input}
+S: Subject to look for in the RDF graph
+P: Predicate to look for in the RDF graph
+O: Object to look for in the RDF graph
+SPARQL Query: SPARQL query to run, including full s-p-o structure and the FROM clause
+'''
+
+# PromptTemplate
+query_prompt_template = PromptTemplate.from_template(template)
+
+
+# =====================
+# TypedDicts für State / Output
+# =====================
+class State(TypedDict):
+    question: str  # only the question is really needed
+
+
+class QueryOutput(TypedDict):
+    """Generated SPARQL query."""
+    query: Annotated[str, ..., "Syntactically valid SPARQL query."]
+
+
+# =====================
+# SPARQL-Query vom LLM schreiben lassen
+# =====================
+def write_query(state: State):
+    """Generate SPARQL query to fetch information from sflights KG."""
+    prompt = query_prompt_template.invoke({"input": state["question"]})
+    structured_llm = anthropic.with_structured_output(QueryOutput)
+    result = structured_llm.invoke(prompt)
+
+    print("\nGenerated SPARQL query:\n")
+    print(result["query"])
+    print("\n-----------------------------\n")
+
+    return {"query": result["query"]}
+
+
+# =====================
+# SPARQL_EXECUTE in HANA aufrufen
+# =====================
+def execute_sparql(query_response):
+    print("Executing SPARQL on HANA...\n")
+
+    cursor = conn.cursor()
+
+    try:
+        resp = cursor.callproc(
+            '"SYS"."SPARQL_EXECUTE"',
+            [
+                query_response["query"],        # REQUEST (NCLOB, IN)
+                "SPARQL Query from Python",     # PARAMETER (NVARCHAR, IN)
+                None,                           # RESPONSE (NCLOB, OUT)
+                None                            # HEADERS (NVARCHAR, OUT)
+            ]
+        )
+
+        response_xml = resp[2]
+        headers_xml = resp[3]
+
+        if not response_xml:
+            print("Empty SPARQL response.")
+            return None
+
+        print("SPARQL Response XML:\n", response_xml)
+        print("\nSPARQL Headers:\n", headers_xml)
+
+        return response_xml
+
+    except Exception as e:
+        print("Error executing SPARQL query:", e)
+        return None
+
+    finally:
+        cursor.close()
+
+
+# =====================
+# Antwort zusammenfassen
+# =====================
+def summarize_info(question: str, query_response: str):
+    if not query_response:
+        print("\nNo data to summarize.")
+        return
+
+    prompt = """
+    Answer the user question below given the following relational information in XML format.
+    Use as much of the query response as possible to give a full, detailed explanation.
+
+    Interpret the URI and predicate information using context.
+    Don't use phrases like 'the entity identified by the URI,' just say what the entity is.
+
+    Make sure the output is readable in a format that can be displayed in an HTML file
+    (paragraphs, lists, simple formatting).
+
+    Please remove unnecessary information. Do not add information about the triples.
+    Do not add the source of the data. Do not include details about what they are identified as
+    or what kind of entity they are unless asked. Do not add any suggestions unless explicitly asked.
+
+    Simply give a crisp and direct answer to what has been asked!
+    If you do not have an answer, please say so. DO NOT HALLUCINATE!
+
+    User Question: {question}
+    Information: {information}
+    """
+
+    summarize = PromptTemplate.from_template(prompt)
+
+    prompt_input = summarize.invoke({
+        "question": question,
+        "information": query_response
+    })
+
+    class QuestionAnswer(TypedDict):
+        """Generated answer."""
+        final_answer: Annotated[str, ..., "Answer to user's question."]
+
+    translate_llm = anthropic.with_structured_output(QuestionAnswer)
+    final_answer = translate_llm.invoke(prompt_input)
+
+    print("\n================= ANSWER =================\n")
+    print(final_answer["final_answer"])
+    print("\n=========================================\n")
+
+
+# =====================
+# Main
+# =====================
+if __name__ == "__main__":
+    question = input("Enter your question about sflights: ")
+    sparql = write_query({"question": question})
+    response = execute_sparql(sparql)
+    summarize_info(question, response)

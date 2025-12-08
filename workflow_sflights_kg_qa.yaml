@@ -1,0 +1,185 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: sflights-kg-qa-ckuderer
+  annotations:
+    scenarios.ai.sap.com/name: "sflights-kg-qa"
+    scenarios.ai.sap.com/description: "QA über den sflights Knowledge Graph in SAP HANA Cloud mit GenAI Hub (Claude)."
+    executables.ai.sap.com/name: "sflights-kg-qa-python"
+    executables.ai.sap.com/description: "Python-Script, das aus einer Frage SPARQL generiert, HANA abfragt und mit Claude zusammenfasst."
+  labels:
+    scenarios.ai.sap.com/id: "sflights-kg-qa"
+    ai.sap.com/version: "1.0"
+    ai.sap.com/resource-group: "default"   # falls du eine andere RG nutzt, hier anpassen
+spec:
+  entrypoint: run-sflights-kg-qa
+
+  templates:
+  - name: run-sflights-kg-qa
+    inputs:
+      parameters:
+      - name: question
+        value: "Which routes go from Frankfurt (FRA) to New York (JFK)?"
+    container:
+      image: python:3.12-slim
+      command: ["bash", "-lc"]
+      args:
+        - |
+          set -e
+
+          echo ">>> Installing Python dependencies..."
+          pip install --no-cache-dir generative-ai-hub-sdk[all] hdbcli
+
+          mkdir -p /app
+          cd /app
+
+          echo ">>> Writing sflights_kg_qa.py ..."
+          cat << 'EOF' > sflights_kg_qa.py
+          import os
+          from typing_extensions import TypedDict, Annotated
+          from langchain_core.prompts import PromptTemplate
+          from hdbcli import dbapi
+          from gen_ai_hub.proxy.langchain.amazon import ChatBedrock
+          from gen_ai_hub.proxy.core.proxy_clients import get_proxy_client
+
+          # IMPORTANT:
+          # In AI Core brauchst du keine manuellen AICORE_* Umgebungsvariablen zu setzen.
+          # Die werden vom System bereitgestellt. Die os.environ-Zeilen aus deinem lokalen
+          # Script bitte hier weglassen.
+
+          # --- GenAI Hub / Claude initialisieren ---
+          proxy_client = get_proxy_client("gen-ai-hub")
+
+          # HIER später den echten proxy_model_name aus deinem Deployment eintragen:
+          anthropic = ChatBedrock(
+              proxy_model_name="anthropic--claude-4.5-sonnet",
+              proxy_client=proxy_client,
+          )
+
+          # --- HANA Connection ---
+          conn = dbapi.connect(
+              address="fec127f4-1bb2-4d30-82e7-083e503ab016.hna1.prod-eu10.hanacloud.ondemand.com",
+              port=443,
+              user="CKUDERER",
+              password="XPRLYQZxeno5712@",
+              databaseName="H00",
+              encrypt="true",
+              sslValidateCertificate="false"
+          )
+
+          template = '''Given an input question, your task is to create a syntactically correct SPARQL query to retrieve information from the sflights RDF graph.
+
+          The data is stored in the named graph <http://example.org/sflights/kg_sflights>.
+          IRIs in this graph usually start with the namespace "http://example.org/sflights#".
+          In the RDF graph, subjects are represented as "s", objects as "o", and predicates as "p".
+
+          The graph may contain variations in spacing, underscores, dashes, capitalization,
+          reversed relationships, and word order. You must account for these variations
+          using the REGEX() function in SPARQL (for example on airport codes, city names,
+          country names, or route codes).
+
+          Example Question:
+          "Which routes go from Frankfurt (FRA) to New York (JFK)?"
+
+          Example SPARQL Query:
+          SELECT ?route ?originAirport ?destinationAirport ?distanceKm ?capacity
+          FROM <http://example.org/sflights/kg_sflights>
+          WHERE {{
+              ?route a <http://example.org/sflights#Route> .
+              ?route <http://example.org/sflights#origin> ?originAirport .
+              ?route <http://example.org/sflights#destination> ?destinationAirport .
+              OPTIONAL {{ ?route <http://example.org/sflights#distanceKm> ?distanceKm . }}
+              OPTIONAL {{ ?route <http://example.org/sflights#passengerCapacity> ?capacity . }}
+              FILTER(
+                  ( REGEX(STR(?originAirport), "FRA", "i")  || REGEX(STR(?originAirport), "Frankfurt", "i") ) &&
+                  ( REGEX(STR(?destinationAirport), "JFK", "i") || REGEX(STR(?destinationAirport), "New York", "i") )
+              )
+          }}
+
+          Always:
+          - Use FROM <http://example.org/sflights/kg_sflights> to restrict the query to this named graph.
+          - Use the http://example.org/sflights# namespace for classes and predicates.
+          - Return useful fields like route, origin, destination, distanceKm, passengerCapacity, airline, cityName, countryName, etc., if they are relevant to the question.
+
+          Use the following format in your answer:
+
+          Question: {input}
+          S: Subject to look for in the RDF graph
+          P: Predicate to look for in the RDF graph
+          O: Object to look for in the RDF graph
+          SPARQL Query: SPARQL query to run, including full s-p-o structure and the FROM clause
+          '''
+
+          query_prompt_template = PromptTemplate.from_template(template)
+
+          class State(TypedDict):
+              question: str
+              s: str
+              p: str
+              o: str
+              query: str
+
+          class QueryOutput(TypedDict):
+              query: Annotated[str, ..., "Syntactically valid SPARQL query."]
+
+          def write_query(state: State):
+              prompt = query_prompt_template.invoke({"input": state["question"]})
+              structured_llm = anthropic.with_structured_output(QueryOutput)
+              result = structured_llm.invoke(prompt)
+              print("Generated SPARQL query:\\n", result["query"])
+              return {"query": result["query"]}
+
+          def execute_sparql(query_response):
+              print("\\nExecuting SPARQL in HANA...\\n")
+              cursor = conn.cursor()
+              try:
+                  resp = cursor.callproc(
+                      '"SYS"."SPARQL_EXECUTE"',
+                      [
+                          query_response["query"],          # REQUEST NCLOB
+                          "SPARQL Query from AI Core",      # PARAMETER NVARCHAR
+                          None,                             # RESPONSE (OUT, NCLOB)
+                          None                              # HEADERS (OUT, NVARCHAR)
+                      ]
+                  )
+                  response_xml = resp[2]
+                  headers_xml = resp[3]
+                  print("SPARQL Response XML:\\n", response_xml)
+                  print("\\nSPARQL Headers:\\n", headers_xml)
+                  return response_xml
+              finally:
+                  cursor.close()
+
+          def summarize_info(question, query_response):
+              prompt = """Answer the user question below given the following relational information in XML format. Use as much as the query response as possible to give a full, detailed explanation. Interpret the URI and predicate information using context. Don't use phrases like 'the entity identified by the URI,' just say what the entity is.
+              Also make sure the output is readable in a format that can be display through an HTML file, add appropriate formatting.
+              Please remove unnecessary information. Do not add information about the triples. Do not add the source of the data.
+              Do not include details about what they are identified as or what kind of entity they are unless asked. Do not add any suggestions unless explicitly asked. Simply give a crisp and direct answer to what has been asked!
+              If you do not have an answer, please say so. DO NOT HALLUCINATE!
+              User Question: {question}
+              Information: {information}
+              """
+              summarize = PromptTemplate.from_template(prompt)
+              prompt_input = summarize.invoke({
+                  "question": question,
+                  "information": query_response
+              })
+
+              class QuestionAnswer(TypedDict):
+                  final_answer: Annotated[str, ..., "Answer to user's question."]
+
+              translate_llm = anthropic.with_structured_output(QuestionAnswer)
+              final_answer = translate_llm.invoke(prompt_input)
+              print("\\nFinal Answer:\\n")
+              print(final_answer["final_answer"])
+
+          if __name__ == "__main__":
+              import sys
+              question = sys.argv[1] if len(sys.argv) > 1 else "Which routes go from Frankfurt (FRA) to New York (JFK)?"
+              sparql = write_query({"question": question})
+              response_xml = execute_sparql(sparql)
+              summarize_info(question, response_xml)
+          EOF
+
+          echo ">>> Running QA script ..."
+          python sflights_kg_qa.py "{{inputs.parameters.question}}"

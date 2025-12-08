@@ -1,0 +1,221 @@
+# Scenario5: Provide User Prompt and retrieve response from KGs from SAP HANA Cloud Using Anthropic Claude from SAP GenAI Hub
+#Required packages: Make Sure you install packages mentioned below. And the code is tested end to end using colab
+#Here are the necessary Packages
+#!%pip install generative-ai-hub-sdk[all]
+# Import necessary libraries and modules
+import os
+from langchain_core.language_models.base import BaseLanguageModel  # Base class for language models
+from pydantic import BaseModel, Field  # For data validation and settings management
+from langchain_core.prompts import PromptTemplate  # For creating prompt templates
+from typing_extensions import TypedDict, Annotated  # For type hints
+from hdbcli import dbapi  # SAP HANA database connector
+from gen_ai_hub.proxy.langchain.amazon import ChatBedrock
+from pydantic import BaseModel, ConfigDict, model_validator
+from gen_ai_hub.proxy.core.proxy_clients import get_proxy_client
+
+# Set up the AI core credentials
+os.environ['AICORE_AUTH_URL'] = "https://5-go-ai-innovation-hub-wvzrulyu.authentication.eu10.hana.ondemand.com" #TODO
+os.environ['AICORE_CLIENT_ID'] = "sb-f7991d09-8de8-4497-bf25-309dfa43f62c!b557249|aicore!b540" #TODO
+os.environ['AICORE_RESOURCE_GROUP'] = 'default'
+os.environ['AICORE_CLIENT_SECRET'] = "ee850c1a-278f-44fb-a4eb-d66eff1ab006$wGy9EaaBoTphfRZNaF_MSGpctylD0dy3hUk1VbvHB14=" #TODO
+os.environ['AICORE_BASE_URL'] = "https://api.ai.prod.eu-central-1.aws.ml.hana.ondemand.com" #TODO
+
+# Custom language model implementation for AWS Bedrock
+class CustomBedrockLLM(BaseLanguageModel):
+
+    # Constructor method
+    def __init__(self, **kwargs):
+        # Call parent class constructor
+        super().__init__(**kwargs)
+
+    # Implementation of required LangChain interface methods
+    def __call__(self, query):
+        return self._call(query)
+
+    def agenerate_prompt(self, input_prompt):
+        return input_prompt
+
+    def apredict(self, query):
+        return self._call(query)
+
+    def apredict_messages(self, messages):
+        return self._call(messages[0].content)
+
+    def generate_prompt(self, input_prompt):
+        return input_prompt
+
+    def invoke(self, query):
+        return self._call(query)
+
+    def predict(self, query):
+        return self._call(query)
+
+    def predict_messages(self, messages):
+        return self._call(messages[0].content)
+        
+proxy_client = get_proxy_client('gen-ai-hub') # Get the proxy client
+
+anthropic = ChatBedrock(
+    model_name="anthropic--claude-4.5-sonnet",
+    proxy_client=proxy_client # Pass the proxy client to ChatBedrock
+)
+
+# Establish connection to SAP HANA database
+conn = dbapi.connect(
+    address="fec127f4-1bb2-4d30-82e7-083e503ab016.hna1.prod-eu10.hanacloud.ondemand.com",
+    port=443,
+    user="CKUDERER",
+    password="XPRLY", 
+    databaseName="H00",
+    encrypt="true",
+    sslValidateCertificate="false"
+)
+
+# Define template for SPARQL query generation
+#give example in template and try different LLMs
+template = '''Given an input question, your task is to create a syntactically correct SPARQL query to retrieve information from the sflights RDF graph.
+
+The data is stored in the named graph <http://example.org/sflights/kg_sflights>.
+IRIs in this graph usually start with the namespace "http://example.org/sflights#".
+In the RDF graph, subjects are represented as "s", objects as "o", and predicates as "p".
+
+The graph may contain variations in spacing, underscores, dashes, capitalization,
+reversed relationships, and word order. You must account for these variations
+using the REGEX() function in SPARQL (for example on airport codes, city names,
+country names, or route codes).
+
+Example Question:
+"Which routes go from Frankfurt (FRA) to New York (JFK)?"
+
+Example SPARQL Query:
+SELECT ?route ?originAirport ?destinationAirport ?distanceKm ?capacity
+FROM <http://example.org/sflights/kg_sflights>
+WHERE {{
+    ?route a <http://example.org/sflights#Route> .
+    ?route <http://example.org/sflights#origin> ?originAirport .
+    ?route <http://example.org/sflights#destination> ?destinationAirport .
+    OPTIONAL {{ ?route <http://example.org/sflights#distanceKm> ?distanceKm . }}
+    OPTIONAL {{ ?route <http://example.org/sflights#passengerCapacity> ?capacity . }}
+    FILTER(
+        ( REGEX(STR(?originAirport), "FRA", "i")  || REGEX(STR(?originAirport), "Frankfurt", "i") ) &&
+        ( REGEX(STR(?destinationAirport), "JFK", "i") || REGEX(STR(?destinationAirport), "New York", "i") )
+    )
+}}
+
+Always:
+- Use FROM <http://example.org/sflights/kg_sflights> to restrict the query to this named graph.
+- Use the http://example.org/sflights# namespace for classes and predicates.
+- Return useful fields like route, origin, destination, distanceKm, passengerCapacity, airline, cityName, countryName, etc., if they are relevant to the question.
+
+Use the following format in your answer:
+
+Question: {input}
+S: Subject to look for in the RDF graph
+P: Predicate to look for in the RDF graph
+O: Object to look for in the RDF graph
+SPARQL Query: SPARQL query to run, including full s-p-o structure and the FROM clause
+'''
+
+# Create prompt template from the template string
+query_prompt_template = PromptTemplate.from_template(template)
+
+# Define type for state dictionary using TypedDict
+class State(TypedDict):
+    question: str  # The input question
+    s: str  # Subject for SPARQL query
+    p: str  # Predicate for SPARQL query
+    o: str  # Object for SPARQL query
+    query: str  # The generated query
+
+# Define output type for structured LLM response
+class QueryOutput(TypedDict):
+    """Generated SPARQL query."""
+    query: Annotated[str, ..., "Syntactically valid SPARQL query."]
+
+# Function to generate SPARQL query from natural language question
+def write_query(state: State):
+    """Generate SPARQL query to fetch information."""
+    # Format the prompt with the input question
+    prompt = query_prompt_template.invoke({"input": state["question"]})
+    
+    # Configure LLM to return structured output
+    structured_llm = anthropic.with_structured_output(QueryOutput)
+    
+    # Get the generated query from LLM
+    result = structured_llm.invoke(prompt)
+    
+    # Print and return the query
+    print(result["query"])
+    return {"query": result["query"]}
+
+# Function to execute SPARQL query against HANA database
+def execute_sparql(query_response):
+    print("\nExecuting SPARQL...\n")
+
+    cursor = conn.cursor()
+
+    try:
+        resp = cursor.callproc(
+            '"SYS"."SPARQL_EXECUTE"',
+            [
+                query_response["query"],            # REQUEST
+                "SPARQL Query from Python",         # PARAMETER
+                None,                                # RESPONSE (OUT)
+                None                                 # HEADERS (OUT)
+            ]
+        )
+
+        response_xml = resp[2]
+        headers_xml  = resp[3]
+
+        print("SPARQL Response XML:\n", response_xml)
+        print("\nSPARQL Headers:\n", headers_xml)
+
+        return response_xml
+
+    except Exception as e:
+        print("Error executing SPARQL query:", e)
+
+    finally:
+        cursor.close()
+
+
+# Function to summarize query results into natural language
+def summarize_info(question, query_response):
+    # Define prompt template for summarization
+    prompt = """Answer the user question below given the following relational information in XML format. Use as much as the query response as possible to give a full, detailed explanation. Interpret the URI and predicate information using context. Don't use phrases like 'the entity identified by the URI,' just say what the entity is.
+    Also make sure the output is readable in a format that can be display through an HTML file, add appropriate formatting.
+    Please remove unnecessary information. Do not add information about the triples. Do not add the source of the data.
+    Do not include details about what they are identified as or what kind of entity they are unless asked. Do not add any suggestions unless explicitly asked. Simply give a crisp and direct answer to what has been asked!
+    If you do not have an answer, please say so. DO NOT HALLUCINATE!
+    User Question: {question}
+    Information: {information}
+    """    
+    # Create prompt template
+    summarize = PromptTemplate.from_template(prompt)
+    
+    # Format the prompt with question and results
+    prompt_input = summarize.invoke({
+        "question": question,
+        "information": query_response
+    })
+
+    # Define output type for summarization
+    class QuestionAnswer(TypedDict):
+        """Generated answer."""
+        final_answer: Annotated[str, ..., "Answer to user's question."]
+
+    # Configure LLM for structured output
+    translate_llm = anthropic.with_structured_output(QuestionAnswer)
+    
+    # Get final answer from LLM
+    final_answer = translate_llm.invoke(prompt_input)
+    
+    # Print and return the answer
+    print(final_answer["final_answer"])
+
+# Main execution flow
+question = input("Enter your question about sflights: ")  # The question to answer
+sparql = write_query({"question": question})  # Generate SPARQL query
+response = execute_sparql(sparql)  # Execute query
+summarize_info(question, response)  # Generate and print answer
